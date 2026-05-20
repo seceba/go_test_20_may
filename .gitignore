@@ -1,0 +1,10 @@
+# Build artifacts
+rpstester
+*.exe
+
+# Runtime files
+errors.log
+*.log
+
+# OS
+.DS_Store
