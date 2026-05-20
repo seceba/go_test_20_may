@@ -2,8 +2,6 @@ package main
 
 import (
 	"bytes"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -23,15 +21,14 @@ import (
 )
 
 type Config struct {
-	Mode          string // "burst" (default) or "simulate"
-	URL           string
-	Batch         int
-	Interval      time.Duration
-	Duration      time.Duration
-	Timeout       time.Duration
-	MaxQuestionID int
-	AnswerChoices int
-	ErrorsLog     string
+	Mode         string // "burst" (default) or "simulate"
+	URL          string
+	Batch        int
+	Interval     time.Duration
+	Duration     time.Duration
+	Timeout      time.Duration
+	MaxUserIndex int
+	ErrorsLog    string
 
 	// simulate mode
 	Students     int
@@ -77,12 +74,6 @@ func classifyError(err error, statusCode int) string {
 	return "unknown"
 }
 
-func randomStudentID() string {
-	b := make([]byte, 4)
-	_, _ = rand.Read(b)
-	return "stu_" + hex.EncodeToString(b)
-}
-
 func computeMetrics(latencies []time.Duration) Metrics {
 	if len(latencies) == 0 {
 		return Metrics{}
@@ -118,17 +109,19 @@ func computeMetrics(latencies []time.Duration) Metrics {
 }
 
 type requestBody struct {
-	QuestionID int    `json:"questionId"`
-	Answer     int    `json:"answer"`
-	StudentID  string `json:"studentId"`
+	UserIndex int `json:"userIndex"`
 }
 
-func doRequest(client *http.Client, cfg Config, wave int, rng *mathrand.Rand) Result {
-	body := requestBody{
-		QuestionID: rng.Intn(cfg.MaxQuestionID) + 1,
-		Answer:     rng.Intn(cfg.AnswerChoices),
-		StudentID:  randomStudentID(),
+type responseBody struct {
+	Success bool `json:"success"`
+}
+
+// userIndex == 0 → rastgele 1..MaxUserIndex. > 0 → o değer kullanılır.
+func doRequest(client *http.Client, cfg Config, wave int, rng *mathrand.Rand, userIndex int) Result {
+	if userIndex == 0 {
+		userIndex = rng.Intn(cfg.MaxUserIndex) + 1
 	}
+	body := requestBody{UserIndex: userIndex}
 	payload, _ := json.Marshal(body)
 
 	start := time.Now()
@@ -152,8 +145,24 @@ func doRequest(client *http.Client, cfg Config, wave int, rng *mathrand.Rand) Re
 		b, _ := io.ReadAll(limited)
 		r.Body = string(b)
 		r.ErrMsg = fmt.Sprintf("HTTP %d", resp.StatusCode)
-	} else {
-		_, _ = io.Copy(io.Discard, resp.Body)
+		return r
+	}
+
+	// 2xx geldi ama body'de success:false olabilir — kontrol et
+	limited := io.LimitReader(resp.Body, 2048)
+	bodyBytes, _ := io.ReadAll(limited)
+	var parsed responseBody
+	if err := json.Unmarshal(bodyBytes, &parsed); err != nil {
+		// Cevap parse edilemedi — uygulama hatası say
+		r.ErrType = "invalid_response"
+		r.ErrMsg = "JSON parse failed"
+		r.Body = string(bodyBytes)
+		return r
+	}
+	if !parsed.Success {
+		r.ErrType = "app_error"
+		r.ErrMsg = "success=false"
+		r.Body = string(bodyBytes)
 	}
 
 	return r
@@ -171,7 +180,7 @@ func worker(client *http.Client, cfg Config, wave int, resultsCh chan<- Result, 
 		}
 	}()
 	rng := mathrand.New(mathrand.NewSource(time.Now().UnixNano() ^ int64(wave)))
-	resultsCh <- doRequest(client, cfg, wave, rng)
+	resultsCh <- doRequest(client, cfg, wave, rng, 0)
 }
 
 type Reporter struct {
@@ -391,7 +400,7 @@ type simStats struct {
 	completedStudents atomic.Int64
 }
 
-func studentSession(client *http.Client, cfg Config, examEnd time.Time, stats *simStats, resultsCh chan<- Result, wg *sync.WaitGroup, seed int64) {
+func studentSession(client *http.Client, cfg Config, examEnd time.Time, stats *simStats, resultsCh chan<- Result, wg *sync.WaitGroup, userIndex int, seed int64) {
 	defer wg.Done()
 	defer func() {
 		if rec := recover(); rec != nil {
@@ -429,7 +438,7 @@ func studentSession(client *http.Client, cfg Config, examEnd time.Time, stats *s
 			}
 		}
 
-		res := doRequest(client, cfg, 0, rng)
+		res := doRequest(client, cfg, 0, rng, userIndex)
 		stats.inFlight.Add(-1)
 		stats.totalSent.Add(1)
 
@@ -519,10 +528,10 @@ func runSimulation(cfg Config) error {
 	start := time.Now()
 	examEnd := start.Add(cfg.ExamDuration)
 
-	// Öğrencileri başlat
+	// Öğrencileri başlat — her öğrenci sabit userIndex=i+1 alır (1..Students)
 	for i := 0; i < cfg.Students; i++ {
 		wg.Add(1)
-		go studentSession(client, cfg, examEnd, stats, resultsCh, &wg, time.Now().UnixNano()^int64(i))
+		go studentSession(client, cfg, examEnd, stats, resultsCh, &wg, i+1, time.Now().UnixNano()^int64(i))
 	}
 
 	wg.Wait()
@@ -640,13 +649,12 @@ func (r *Reporter) printSimulationReport(cfg Config, totalDuration time.Duration
 func main() {
 	cfg := Config{}
 	flag.StringVar(&cfg.Mode, "mode", "burst", "Test modu: burst (dalga) veya simulate (sınav simülasyonu)")
-	flag.StringVar(&cfg.URL, "url", "https://api.canavar.online/api/tester/answer", "Hedef endpoint URL")
+	flag.StringVar(&cfg.URL, "url", "https://sinavkutusu.com/v1/stress-test/run", "Hedef endpoint URL")
 	flag.IntVar(&cfg.Batch, "batch", 500, "[burst] Her dalgadaki eşzamanlı istek sayısı")
 	flag.DurationVar(&cfg.Interval, "interval", 5*time.Second, "[burst] Dalgalar arası bekleme")
 	flag.DurationVar(&cfg.Duration, "duration", 30*time.Second, "[burst] Toplam test süresi")
 	flag.DurationVar(&cfg.Timeout, "timeout", 10*time.Second, "Her isteğin HTTP timeout süresi")
-	flag.IntVar(&cfg.MaxQuestionID, "max-question-id", 25, "questionId 1..N rastgele üretilir")
-	flag.IntVar(&cfg.AnswerChoices, "answer-choices", 4, "answer 0..N-1 rastgele üretilir")
+	flag.IntVar(&cfg.MaxUserIndex, "max-user-index", 15000, "[burst] userIndex 1..N rastgele üretilir")
 	flag.StringVar(&cfg.ErrorsLog, "errors-log", "errors.log", "Hata log dosyası yolu")
 
 	// simulate mode parametreleri
@@ -658,11 +666,8 @@ func main() {
 
 	flag.Parse()
 
-	if cfg.MaxQuestionID < 1 {
-		log.Fatal("max-question-id en az 1 olmalı")
-	}
-	if cfg.AnswerChoices < 1 {
-		log.Fatal("answer-choices en az 1 olmalı")
+	if cfg.MaxUserIndex < 1 {
+		log.Fatal("max-user-index en az 1 olmalı")
 	}
 
 	switch cfg.Mode {
