@@ -17,11 +17,13 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
 
 type Config struct {
+	Mode          string // "burst" (default) or "simulate"
 	URL           string
 	Batch         int
 	Interval      time.Duration
@@ -30,6 +32,13 @@ type Config struct {
 	MaxQuestionID int
 	AnswerChoices int
 	ErrorsLog     string
+
+	// simulate mode
+	Students     int
+	ExamDuration time.Duration
+	Questions    int
+	ThinkTime    time.Duration
+	Rampup       time.Duration
 }
 
 type Result struct {
@@ -373,21 +382,282 @@ func runTest(cfg Config) error {
 	return nil
 }
 
+// ─── Simulation mode ────────────────────────────────────────────────────────
+
+type simStats struct {
+	totalSent         atomic.Int64
+	inFlight          atomic.Int64
+	peakInFlight      atomic.Int64
+	completedStudents atomic.Int64
+}
+
+func studentSession(client *http.Client, cfg Config, examEnd time.Time, stats *simStats, resultsCh chan<- Result, wg *sync.WaitGroup, seed int64) {
+	defer wg.Done()
+	defer func() {
+		if rec := recover(); rec != nil {
+			resultsCh <- Result{ErrType: "unknown", ErrMsg: fmt.Sprintf("panic: %v", rec)}
+		}
+	}()
+
+	rng := mathrand.New(mathrand.NewSource(seed))
+
+	// Rampup: rastgele 0..Rampup arası bekle
+	if cfg.Rampup > 0 {
+		delay := time.Duration(rng.Int63n(int64(cfg.Rampup)))
+		time.Sleep(delay)
+	}
+
+	answered := 0
+	for answered < cfg.Questions && time.Now().Before(examEnd) {
+		// Düşünme süresi: think-time ± %30 jitter
+		jitter := 0.7 + rng.Float64()*0.6 // 0.7 .. 1.3
+		think := time.Duration(float64(cfg.ThinkTime) * jitter)
+
+		// Eğer think süresinin sonu sınav bitişini aşıyorsa bitir
+		if time.Now().Add(think).After(examEnd) {
+			return
+		}
+		time.Sleep(think)
+
+		// Cevap gönder
+		inFlight := stats.inFlight.Add(1)
+		// Peak güncelle (CAS loop)
+		for {
+			peak := stats.peakInFlight.Load()
+			if inFlight <= peak || stats.peakInFlight.CompareAndSwap(peak, inFlight) {
+				break
+			}
+		}
+
+		res := doRequest(client, cfg, 0, rng)
+		stats.inFlight.Add(-1)
+		stats.totalSent.Add(1)
+
+		resultsCh <- res
+		answered++
+	}
+	stats.completedStudents.Add(1)
+}
+
+func runSimulation(cfg Config) error {
+	transport := &http.Transport{
+		MaxIdleConns:        cfg.Students,
+		MaxIdleConnsPerHost: cfg.Students,
+		MaxConnsPerHost:     cfg.Students,
+		IdleConnTimeout:     5 * time.Minute,
+	}
+	client := &http.Client{
+		Timeout:   cfg.Timeout,
+		Transport: transport,
+	}
+
+	reporter, err := newReporter(cfg.ErrorsLog)
+	if err != nil {
+		return err
+	}
+	defer reporter.close()
+
+	fmt.Printf("Starting EXAM SIMULATION:\n")
+	fmt.Printf("  URL:           %s\n", cfg.URL)
+	fmt.Printf("  Students:      %d\n", cfg.Students)
+	fmt.Printf("  Exam duration: %s\n", cfg.ExamDuration)
+	fmt.Printf("  Questions/stu: %d\n", cfg.Questions)
+	fmt.Printf("  Think time:    %s (±30%% jitter)\n", cfg.ThinkTime)
+	fmt.Printf("  Rampup:        %s\n", cfg.Rampup)
+	fmt.Printf("  Timeout:       %s per request\n", cfg.Timeout)
+	fmt.Printf("  Expected avg:  ~%.0f RPS\n\n",
+		float64(cfg.Students)/cfg.ThinkTime.Seconds())
+
+	stats := &simStats{}
+	var wg sync.WaitGroup
+	resultsCh := make(chan Result, cfg.Students)
+
+	// Sonuç tüketici goroutine
+	allResults := make([]Result, 0, cfg.Students*cfg.Questions)
+	var consumerWg sync.WaitGroup
+	consumerWg.Add(1)
+	go func() {
+		defer consumerWg.Done()
+		for res := range resultsCh {
+			allResults = append(allResults, res)
+		}
+	}()
+
+	// Per-second RPS sampler
+	rpsSamples := make([]int64, 0, int(cfg.ExamDuration.Seconds())+10)
+	stopSampler := make(chan struct{})
+	var samplerWg sync.WaitGroup
+	samplerWg.Add(1)
+	go func() {
+		defer samplerWg.Done()
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+		var lastTotal int64
+		var lastPrint time.Time = time.Now()
+		for {
+			select {
+			case <-ticker.C:
+				now := stats.totalSent.Load()
+				delta := now - lastTotal
+				rpsSamples = append(rpsSamples, delta)
+				lastTotal = now
+
+				// Her 10 saniyede bir canlı durum yazdır
+				if time.Since(lastPrint) >= 10*time.Second {
+					lastPrint = time.Now()
+					fmt.Printf("[%s] sent=%d  in-flight=%d  this-sec=%d  peak-in-flight=%d  completed=%d\n",
+						time.Now().Format("15:04:05"),
+						now, stats.inFlight.Load(), delta,
+						stats.peakInFlight.Load(), stats.completedStudents.Load())
+				}
+			case <-stopSampler:
+				return
+			}
+		}
+	}()
+
+	start := time.Now()
+	examEnd := start.Add(cfg.ExamDuration)
+
+	// Öğrencileri başlat
+	for i := 0; i < cfg.Students; i++ {
+		wg.Add(1)
+		go studentSession(client, cfg, examEnd, stats, resultsCh, &wg, time.Now().UnixNano()^int64(i))
+	}
+
+	wg.Wait()
+	close(resultsCh)
+	consumerWg.Wait()
+	close(stopSampler)
+	samplerWg.Wait()
+
+	totalDuration := time.Since(start)
+
+	reporter.record(allResults)
+	reporter.printSimulationReport(cfg, totalDuration, allResults, rpsSamples, stats)
+	return nil
+}
+
+func (r *Reporter) printSimulationReport(cfg Config, totalDuration time.Duration, all []Result, rpsSamples []int64, stats *simStats) {
+	total := len(all)
+	var success, failed int
+	latencies := make([]time.Duration, 0, total)
+	for _, res := range all {
+		latencies = append(latencies, res.Latency)
+		if res.ErrType == "" {
+			success++
+		} else {
+			failed++
+		}
+	}
+	m := computeMetrics(latencies)
+
+	successPct, failedPct := 0.0, 0.0
+	if total > 0 {
+		successPct = 100.0 * float64(success) / float64(total)
+		failedPct = 100.0 * float64(failed) / float64(total)
+	}
+
+	// RPS dağılımı (saniye başı)
+	rpsAvg, rpsP50, rpsP95, rpsPeak := int64(0), int64(0), int64(0), int64(0)
+	if len(rpsSamples) > 0 {
+		sorted := make([]int64, len(rpsSamples))
+		copy(sorted, rpsSamples)
+		sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+		var sum int64
+		for _, v := range sorted {
+			sum += v
+		}
+		rpsAvg = sum / int64(len(sorted))
+		rpsP50 = sorted[len(sorted)/2]
+		idx95 := int(float64(len(sorted))*0.95 + 0.999999)
+		if idx95 > len(sorted) {
+			idx95 = len(sorted)
+		}
+		if idx95 < 1 {
+			idx95 = 1
+		}
+		rpsP95 = sorted[idx95-1]
+		rpsPeak = sorted[len(sorted)-1]
+	}
+
+	completedStu := stats.completedStudents.Load()
+	completedPct := 0.0
+	if cfg.Students > 0 {
+		completedPct = 100.0 * float64(completedStu) / float64(cfg.Students)
+	}
+
+	fmt.Println()
+	fmt.Println("╔══════════════════════════════════════════════════════════╗")
+	fmt.Println("║              EXAM SIMULATION REPORT                      ║")
+	fmt.Println("╠══════════════════════════════════════════════════════════╣")
+	fmt.Printf("║ Duration:               %-33s║\n", totalDuration.Round(time.Second))
+	fmt.Printf("║ Students simulated:     %-33d║\n", cfg.Students)
+	fmt.Printf("║ Students completed:     %-33s║\n",
+		fmt.Sprintf("%d (%.1f%%)", completedStu, completedPct))
+	fmt.Printf("║ Total answers sent:     %-33d║\n", total)
+	fmt.Printf("║ Successful:             %-33s║\n",
+		fmt.Sprintf("%d (%.1f%%)", success, successPct))
+	fmt.Printf("║ Failed:                 %-33s║\n",
+		fmt.Sprintf("%d (%.1f%%)", failed, failedPct))
+	fmt.Println("║                                                          ║")
+	fmt.Println("║ RPS per second (across test):                            ║")
+	fmt.Printf("║   avg     = %-45s║\n", fmt.Sprintf("%d req/s", rpsAvg))
+	fmt.Printf("║   p50     = %-45s║\n", fmt.Sprintf("%d req/s", rpsP50))
+	fmt.Printf("║   p95     = %-45s║\n", fmt.Sprintf("%d req/s", rpsP95))
+	fmt.Printf("║   peak    = %-45s║\n", fmt.Sprintf("%d req/s (en yoğun saniye)", rpsPeak))
+	fmt.Println("║                                                          ║")
+	fmt.Printf("║ Peak concurrent in-flight: %-30d║\n", stats.peakInFlight.Load())
+	fmt.Println("║                                                          ║")
+	fmt.Println("║ Latency (overall):                                       ║")
+	fmt.Printf("║   min     = %-45s║\n", m.Min.Round(time.Millisecond))
+	fmt.Printf("║   avg     = %-45s║\n", m.Avg.Round(time.Millisecond))
+	fmt.Printf("║   p50     = %-45s║\n", m.P50.Round(time.Millisecond))
+	fmt.Printf("║   p95     = %-45s║\n", m.P95.Round(time.Millisecond))
+	fmt.Printf("║   p99     = %-45s║\n", m.P99.Round(time.Millisecond))
+	fmt.Printf("║   max     = %-45s║\n", m.Max.Round(time.Millisecond))
+	if len(r.statusCount) > 0 {
+		fmt.Println("║                                                          ║")
+		fmt.Println("║ HTTP Status Distribution:                                ║")
+		for code, count := range r.statusCount {
+			fmt.Printf("║   %-3d                 : %-32d║\n", code, count)
+		}
+	}
+	if len(r.errorCount) > 0 {
+		fmt.Println("║                                                          ║")
+		fmt.Println("║ Error Distribution:                                      ║")
+		for k, v := range r.errorCount {
+			fmt.Printf("║   %-20s : %-32d║\n", k, v)
+		}
+	}
+	if r.totalErrors > 0 {
+		fmt.Println("║                                                          ║")
+		fmt.Printf("║ Errors logged to:     %-35s║\n", fmt.Sprintf("errors.log (%d entries)", r.totalErrors))
+	}
+	fmt.Println("╚══════════════════════════════════════════════════════════╝")
+}
+
 func main() {
 	cfg := Config{}
+	flag.StringVar(&cfg.Mode, "mode", "burst", "Test modu: burst (dalga) veya simulate (sınav simülasyonu)")
 	flag.StringVar(&cfg.URL, "url", "https://api.canavar.online/api/tester/answer", "Hedef endpoint URL")
-	flag.IntVar(&cfg.Batch, "batch", 500, "Her dalgadaki eşzamanlı istek sayısı")
-	flag.DurationVar(&cfg.Interval, "interval", 5*time.Second, "Dalgalar arası bekleme")
-	flag.DurationVar(&cfg.Duration, "duration", 30*time.Second, "Toplam test süresi")
-	flag.DurationVar(&cfg.Timeout, "timeout", 10*time.Second, "Her isteğin timeout süresi")
+	flag.IntVar(&cfg.Batch, "batch", 500, "[burst] Her dalgadaki eşzamanlı istek sayısı")
+	flag.DurationVar(&cfg.Interval, "interval", 5*time.Second, "[burst] Dalgalar arası bekleme")
+	flag.DurationVar(&cfg.Duration, "duration", 30*time.Second, "[burst] Toplam test süresi")
+	flag.DurationVar(&cfg.Timeout, "timeout", 10*time.Second, "Her isteğin HTTP timeout süresi")
 	flag.IntVar(&cfg.MaxQuestionID, "max-question-id", 25, "questionId 1..N rastgele üretilir")
 	flag.IntVar(&cfg.AnswerChoices, "answer-choices", 4, "answer 0..N-1 rastgele üretilir")
 	flag.StringVar(&cfg.ErrorsLog, "errors-log", "errors.log", "Hata log dosyası yolu")
+
+	// simulate mode parametreleri
+	flag.IntVar(&cfg.Students, "students", 15000, "[simulate] Sınava giren öğrenci sayısı")
+	flag.DurationVar(&cfg.ExamDuration, "exam-duration", 60*time.Minute, "[simulate] Sınav süresi")
+	flag.IntVar(&cfg.Questions, "questions", 25, "[simulate] Her öğrencinin cevaplayacağı soru sayısı")
+	flag.DurationVar(&cfg.ThinkTime, "think-time", 30*time.Second, "[simulate] Cevaplar arası ortalama düşünme süresi (±30%% jitter)")
+	flag.DurationVar(&cfg.Rampup, "rampup", 2*time.Minute, "[simulate] Öğrencilerin sınava giriş süresi (kademeli)")
+
 	flag.Parse()
 
-	if cfg.Batch < 1 {
-		log.Fatal("batch en az 1 olmalı")
-	}
 	if cfg.MaxQuestionID < 1 {
 		log.Fatal("max-question-id en az 1 olmalı")
 	}
@@ -395,7 +665,28 @@ func main() {
 		log.Fatal("answer-choices en az 1 olmalı")
 	}
 
-	if err := runTest(cfg); err != nil {
-		log.Fatal(err)
+	switch cfg.Mode {
+	case "burst":
+		if cfg.Batch < 1 {
+			log.Fatal("batch en az 1 olmalı")
+		}
+		if err := runTest(cfg); err != nil {
+			log.Fatal(err)
+		}
+	case "simulate":
+		if cfg.Students < 1 {
+			log.Fatal("students en az 1 olmalı")
+		}
+		if cfg.Questions < 1 {
+			log.Fatal("questions en az 1 olmalı")
+		}
+		if cfg.ThinkTime <= 0 {
+			log.Fatal("think-time pozitif olmalı")
+		}
+		if err := runSimulation(cfg); err != nil {
+			log.Fatal(err)
+		}
+	default:
+		log.Fatalf("bilinmeyen mode: %q (burst veya simulate)", cfg.Mode)
 	}
 }
