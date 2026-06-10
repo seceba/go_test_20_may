@@ -20,6 +20,10 @@ import (
 	"time"
 )
 
+// questions target için varsayılan Bearer token (test ortamı, deneme2 sınavı, ~1 yıl geçerli).
+// -token flag'i ile override edilebilir. Geçersiz olursa yenisini buraya yapıştır veya -token ver.
+const defaultToken = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOiI2YTI5OWEwNzJmODVjYWQwNTI4NzNjZDciLCJyb2xlIjoidXNlciIsInNlc3Npb25JZCI6ImNvNWQ3eDZ4cTVtcThib2xkZiIsImlhdCI6MTc4MTExMTMwMywiZXhwIjoxODEyNjQ3MzAzfQ.BobaIR1wt9Zz_gp9rcPCLnl8G3qTcIvVpI1U4QwcicE"
+
 type Config struct {
 	Mode         string // "burst" (default), "simulate", "rate"
 	Target       string // "userindex" (default), "best-server", "login"
@@ -943,7 +947,7 @@ func main() {
 	flag.StringVar(&cfg.OkulKodu, "okul-kodu", "311", "[login] Login için okul kodu")
 	flag.StringVar(&cfg.OgrenciNo, "ogrenci-no", "123", "[login] Login için öğrenci no (kayıtlı olmalı)")
 	flag.StringVar(&cfg.Phone, "phone", "123", "[login] Login için telefon")
-	flag.StringVar(&cfg.Token, "token", "", "[questions] Bearer token (Authorization header)")
+	flag.StringVar(&cfg.Token, "token", defaultToken, "[questions] Bearer token (Authorization header)")
 	flag.StringVar(&cfg.ErrorsLog, "errors-log", "errors.log", "Hata log dosyası yolu")
 
 	// simulate mode parametreleri
