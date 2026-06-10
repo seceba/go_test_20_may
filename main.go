@@ -29,6 +29,7 @@ type Config struct {
 	Target       string // "userindex" (default), "best-server", "login"
 	URL          string
 	Batch        int
+	Waves        int // [burst] sabit wave sayısı (>0 ise Duration yok sayılır)
 	Interval     time.Duration
 	Duration     time.Duration
 	Timeout      time.Duration
@@ -481,13 +482,18 @@ func runTest(cfg Config) error {
 	fmt.Printf("  URL:      %s\n", cfg.URL)
 	fmt.Printf("  Batch:    %d requests/wave\n", cfg.Batch)
 	fmt.Printf("  Interval: %s between waves\n", cfg.Interval)
-	fmt.Printf("  Duration: %s total\n", cfg.Duration)
+	if cfg.Waves > 0 {
+		fmt.Printf("  Waves:    %d (sabit)\n", cfg.Waves)
+	} else {
+		fmt.Printf("  Duration: %s total\n", cfg.Duration)
+	}
 	fmt.Printf("  Timeout:  %s per request\n", cfg.Timeout)
 
 	start := time.Now()
 	wave := 0
 
-	for time.Since(start) < cfg.Duration {
+	// Döngü koşulu: Waves > 0 ise sabit wave sayısı, değilse süreye bağlı.
+	for (cfg.Waves > 0 && wave < cfg.Waves) || (cfg.Waves <= 0 && time.Since(start) < cfg.Duration) {
 		wave++
 		var wg sync.WaitGroup
 		resultsCh := make(chan Result, cfg.Batch)
@@ -509,7 +515,12 @@ func runTest(cfg Config) error {
 		reporter.printWaveSummary(wave, waveResults, waveDuration)
 		reporter.record(waveResults)
 
-		if time.Since(start)+cfg.Interval < cfg.Duration {
+		// Wave arası bekleme. Sabit-wave modunda son wave'den sonra bekleme.
+		if cfg.Waves > 0 {
+			if wave < cfg.Waves {
+				time.Sleep(cfg.Interval)
+			}
+		} else if time.Since(start)+cfg.Interval < cfg.Duration {
 			time.Sleep(cfg.Interval)
 		} else {
 			break
@@ -940,6 +951,7 @@ func main() {
 	flag.StringVar(&cfg.Target, "target", "best-server", "Hedef tipi: best-server | login | userindex")
 	flag.StringVar(&cfg.URL, "url", "https://giris.sinavkutusu.com/api/best-server", "Hedef endpoint URL")
 	flag.IntVar(&cfg.Batch, "batch", 500, "[burst] Her dalgadaki eşzamanlı istek sayısı")
+	flag.IntVar(&cfg.Waves, "waves", 0, "[burst] Sabit wave sayısı (>0 ise -duration yok sayılır)")
 	flag.DurationVar(&cfg.Interval, "interval", 5*time.Second, "[burst] Dalgalar arası bekleme")
 	flag.DurationVar(&cfg.Duration, "duration", 30*time.Second, "[burst] Toplam test süresi")
 	flag.DurationVar(&cfg.Timeout, "timeout", 10*time.Second, "Her isteğin HTTP timeout süresi")
