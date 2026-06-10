@@ -22,12 +22,14 @@ import (
 
 type Config struct {
 	Mode         string // "burst" (default) or "simulate"
+	Target       string // "userindex" (default), "best-server", "login"
 	URL          string
 	Batch        int
 	Interval     time.Duration
 	Duration     time.Duration
 	Timeout      time.Duration
 	MaxUserIndex int
+	OkulKodu     string // login target için okul kodu
 	ErrorsLog    string
 
 	// simulate mode
@@ -116,16 +118,97 @@ type responseBody struct {
 	Success bool `json:"success"`
 }
 
+type loginBody struct {
+	OkulKodu    string `json:"okulKodu"`
+	OgrenciNo   string `json:"ogrenciNo"`
+	Phone       string `json:"phone"`
+	Sinif       string `json:"sinif"`
+	DogumTarihi string `json:"dogumTarihi"`
+	Name        string `json:"name"`
+	Surname     string `json:"surname"`
+}
+
+type loginResponse struct {
+	User struct {
+		Token string `json:"token"`
+	} `json:"user"`
+}
+
+// buildRequest, target tipine göre HTTP method + body üretir.
 // userIndex == 0 → rastgele 1..MaxUserIndex. > 0 → o değer kullanılır.
-func doRequest(client *http.Client, cfg Config, wave int, rng *mathrand.Rand, userIndex int) Result {
+func buildRequest(cfg Config, rng *mathrand.Rand, userIndex int) (*http.Request, error) {
 	if userIndex == 0 {
 		userIndex = rng.Intn(cfg.MaxUserIndex) + 1
 	}
-	body := requestBody{UserIndex: userIndex}
-	payload, _ := json.Marshal(body)
+
+	switch cfg.Target {
+	case "best-server":
+		// Auth gerektirmeyen hafif GET isteği, body yok.
+		return http.NewRequest(http.MethodGet, cfg.URL, nil)
+
+	case "login":
+		lb := loginBody{
+			OkulKodu:    cfg.OkulKodu,
+			OgrenciNo:   fmt.Sprintf("%d", userIndex),
+			Phone:       "5550000000",
+			Sinif:       "9",
+			DogumTarihi: "2005-01-01",
+			Name:        "Load",
+			Surname:     "Test",
+		}
+		payload, _ := json.Marshal(lb)
+		req, err := http.NewRequest(http.MethodPost, cfg.URL, bytes.NewReader(payload))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		return req, nil
+
+	default: // "userindex"
+		payload, _ := json.Marshal(requestBody{UserIndex: userIndex})
+		req, err := http.NewRequest(http.MethodPost, cfg.URL, bytes.NewReader(payload))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		return req, nil
+	}
+}
+
+// validateBody, 2xx gelen cevabın gövdesini target'a göre doğrular.
+// Başarılıysa "" döner, aksi halde (errType, errMsg) döner.
+func validateBody(cfg Config, bodyBytes []byte) (errType, errMsg string) {
+	switch cfg.Target {
+	case "login":
+		var lr loginResponse
+		if err := json.Unmarshal(bodyBytes, &lr); err != nil {
+			return "invalid_response", "JSON parse failed"
+		}
+		if lr.User.Token == "" {
+			return "app_error", "token yok"
+		}
+		return "", ""
+
+	default: // best-server, userindex → {"success": true}
+		var parsed responseBody
+		if err := json.Unmarshal(bodyBytes, &parsed); err != nil {
+			return "invalid_response", "JSON parse failed"
+		}
+		if !parsed.Success {
+			return "app_error", "success=false"
+		}
+		return "", ""
+	}
+}
+
+func doRequest(client *http.Client, cfg Config, wave int, rng *mathrand.Rand, userIndex int) Result {
+	req, err := buildRequest(cfg, rng, userIndex)
+	if err != nil {
+		return Result{Wave: wave, ErrType: "unknown", ErrMsg: err.Error()}
+	}
 
 	start := time.Now()
-	resp, err := client.Post(cfg.URL, "application/json", bytes.NewReader(payload))
+	resp, err := client.Do(req)
 	latency := time.Since(start)
 
 	r := Result{Wave: wave, Latency: latency}
@@ -148,20 +231,12 @@ func doRequest(client *http.Client, cfg Config, wave int, rng *mathrand.Rand, us
 		return r
 	}
 
-	// 2xx geldi ama body'de success:false olabilir — kontrol et
+	// 2xx geldi — target'a göre body doğrula
 	limited := io.LimitReader(resp.Body, 2048)
 	bodyBytes, _ := io.ReadAll(limited)
-	var parsed responseBody
-	if err := json.Unmarshal(bodyBytes, &parsed); err != nil {
-		// Cevap parse edilemedi — uygulama hatası say
-		r.ErrType = "invalid_response"
-		r.ErrMsg = "JSON parse failed"
-		r.Body = string(bodyBytes)
-		return r
-	}
-	if !parsed.Success {
-		r.ErrType = "app_error"
-		r.ErrMsg = "success=false"
+	if et, em := validateBody(cfg, bodyBytes); et != "" {
+		r.ErrType = et
+		r.ErrMsg = em
 		r.Body = string(bodyBytes)
 	}
 
@@ -649,12 +724,14 @@ func (r *Reporter) printSimulationReport(cfg Config, totalDuration time.Duration
 func main() {
 	cfg := Config{}
 	flag.StringVar(&cfg.Mode, "mode", "burst", "Test modu: burst (dalga) veya simulate (sınav simülasyonu)")
-	flag.StringVar(&cfg.URL, "url", "https://sinavkutusu.com/v1/stress-test/run", "Hedef endpoint URL")
+	flag.StringVar(&cfg.Target, "target", "best-server", "Hedef tipi: best-server | login | userindex")
+	flag.StringVar(&cfg.URL, "url", "https://giris.sinavkutusu.com/api/best-server", "Hedef endpoint URL")
 	flag.IntVar(&cfg.Batch, "batch", 500, "[burst] Her dalgadaki eşzamanlı istek sayısı")
 	flag.DurationVar(&cfg.Interval, "interval", 5*time.Second, "[burst] Dalgalar arası bekleme")
 	flag.DurationVar(&cfg.Duration, "duration", 30*time.Second, "[burst] Toplam test süresi")
 	flag.DurationVar(&cfg.Timeout, "timeout", 10*time.Second, "Her isteğin HTTP timeout süresi")
-	flag.IntVar(&cfg.MaxUserIndex, "max-user-index", 15000, "[burst] userIndex 1..N rastgele üretilir")
+	flag.IntVar(&cfg.MaxUserIndex, "max-user-index", 15000, "userIndex/ogrenciNo 1..N rastgele üretilir")
+	flag.StringVar(&cfg.OkulKodu, "okul-kodu", "311", "[login] Login için okul kodu")
 	flag.StringVar(&cfg.ErrorsLog, "errors-log", "errors.log", "Hata log dosyası yolu")
 
 	// simulate mode parametreleri
@@ -668,6 +745,12 @@ func main() {
 
 	if cfg.MaxUserIndex < 1 {
 		log.Fatal("max-user-index en az 1 olmalı")
+	}
+	switch cfg.Target {
+	case "best-server", "login", "userindex":
+		// geçerli
+	default:
+		log.Fatalf("bilinmeyen target: %q (best-server | login | userindex)", cfg.Target)
 	}
 
 	switch cfg.Mode {
