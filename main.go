@@ -47,6 +47,7 @@ type Result struct {
 	ErrType    string
 	ErrMsg     string
 	Body       string
+	ServerNum  int // best-server target'ında dönen serverNum (0 = yok)
 }
 
 type Metrics struct {
@@ -115,7 +116,8 @@ type requestBody struct {
 }
 
 type responseBody struct {
-	Success bool `json:"success"`
+	Success   bool `json:"success"`
+	ServerNum int  `json:"serverNum"`
 }
 
 type loginBody struct {
@@ -238,6 +240,15 @@ func doRequest(client *http.Client, cfg Config, wave int, rng *mathrand.Rand, us
 		r.ErrType = et
 		r.ErrMsg = em
 		r.Body = string(bodyBytes)
+		return r
+	}
+
+	// best-server: dönen serverNum'ı kaydet (dağılım raporu için)
+	if cfg.Target == "best-server" {
+		var br responseBody
+		if json.Unmarshal(bodyBytes, &br) == nil {
+			r.ServerNum = br.ServerNum
+		}
 	}
 
 	return r
@@ -259,11 +270,12 @@ func worker(client *http.Client, cfg Config, wave int, resultsCh chan<- Result, 
 }
 
 type Reporter struct {
-	allResults  []Result
-	statusCount map[int]int
-	errorCount  map[string]int
-	errorsFile  *os.File
-	totalErrors int
+	allResults     []Result
+	statusCount    map[int]int
+	errorCount     map[string]int
+	serverNumCount map[int]int
+	errorsFile     *os.File
+	totalErrors    int
 }
 
 func newReporter(errorsLogPath string) (*Reporter, error) {
@@ -272,9 +284,10 @@ func newReporter(errorsLogPath string) (*Reporter, error) {
 		return nil, fmt.Errorf("errors.log oluşturulamadı: %w", err)
 	}
 	return &Reporter{
-		statusCount: map[int]int{},
-		errorCount:  map[string]int{},
-		errorsFile:  f,
+		statusCount:    map[int]int{},
+		errorCount:     map[string]int{},
+		serverNumCount: map[int]int{},
+		errorsFile:     f,
 	}, nil
 }
 
@@ -283,6 +296,9 @@ func (r *Reporter) record(results []Result) {
 		r.allResults = append(r.allResults, res)
 		if res.StatusCode != 0 {
 			r.statusCount[res.StatusCode]++
+		}
+		if res.ServerNum > 0 {
+			r.serverNumCount[res.ServerNum]++
 		}
 		if res.ErrType != "" {
 			r.errorCount[res.ErrType]++
@@ -381,6 +397,20 @@ func (r *Reporter) printFinalReport(totalDuration time.Duration, waves int) {
 		fmt.Println("║ HTTP Status Distribution:                                ║")
 		for code, count := range r.statusCount {
 			fmt.Printf("║   %-3d                 : %-32d║\n", code, count)
+		}
+	}
+	if len(r.serverNumCount) > 0 {
+		fmt.Println("║                                                          ║")
+		fmt.Println("║ Server Distribution (serverNum dağılımı):                ║")
+		nums := make([]int, 0, len(r.serverNumCount))
+		for n := range r.serverNumCount {
+			nums = append(nums, n)
+		}
+		sort.Ints(nums)
+		for _, n := range nums {
+			cnt := r.serverNumCount[n]
+			pct := 100.0 * float64(cnt) / float64(len(r.allResults))
+			fmt.Printf("║   sinav%-2d             : %-32s║\n", n, fmt.Sprintf("%d (%.1f%%)", cnt, pct))
 		}
 	}
 	if len(r.errorCount) > 0 {
