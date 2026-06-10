@@ -21,7 +21,7 @@ import (
 )
 
 type Config struct {
-	Mode         string // "burst" (default) or "simulate"
+	Mode         string // "burst" (default), "simulate", "rate"
 	Target       string // "userindex" (default), "best-server", "login"
 	URL          string
 	Batch        int
@@ -31,6 +31,9 @@ type Config struct {
 	MaxUserIndex int
 	OkulKodu     string // login target için okul kodu
 	ErrorsLog    string
+
+	// rate mode (sabit hız / open-loop)
+	RPS int
 
 	// simulate mode
 	Students     int
@@ -421,7 +424,9 @@ func (r *Reporter) printFinalReport(totalDuration time.Duration, waves int) {
 		}
 	}
 	fmt.Println("║                                                          ║")
+	successfulRPS := float64(success) / totalDuration.Seconds()
 	fmt.Printf("║ Effective RPS:        %-35.1f║\n", rps)
+	fmt.Printf("║ Successful RPS:       %-35.1f║\n", successfulRPS)
 	if r.totalErrors > 0 {
 		fmt.Printf("║ Errors logged to:     %-35s║\n", fmt.Sprintf("errors.log (%d entries)", r.totalErrors))
 	}
@@ -751,9 +756,167 @@ func (r *Reporter) printSimulationReport(cfg Config, totalDuration time.Duration
 	fmt.Println("╚══════════════════════════════════════════════════════════╝")
 }
 
+// ─── Rate mode (sabit hız / open-loop) ──────────────────────────────────────
+// Her saniye tam RPS kadar istek fırlatır (önceki bitmese bile). Server'ın
+// "saniyede şu kadar kaldırıyor" rakamını net ölçmek için.
+
+func runRate(cfg Config) error {
+	transport := &http.Transport{
+		MaxIdleConns:        cfg.RPS * 4,
+		MaxIdleConnsPerHost: cfg.RPS * 4,
+		MaxConnsPerHost:     cfg.RPS * 4,
+		IdleConnTimeout:     90 * time.Second,
+	}
+	client := &http.Client{Timeout: cfg.Timeout, Transport: transport}
+
+	reporter, err := newReporter(cfg.ErrorsLog)
+	if err != nil {
+		return err
+	}
+	defer reporter.close()
+
+	totalSeconds := int(cfg.Duration.Seconds())
+	if totalSeconds < 1 {
+		totalSeconds = 1
+	}
+
+	fmt.Printf("Starting RATE test (sabit hız / open-loop):\n")
+	fmt.Printf("  URL:       %s\n", cfg.URL)
+	fmt.Printf("  Target:    %d req/s sabit\n", cfg.RPS)
+	fmt.Printf("  Duration:  %ds (toplam ~%d istek)\n", totalSeconds, cfg.RPS*totalSeconds)
+	fmt.Printf("  Timeout:   %s\n\n", cfg.Timeout)
+
+	stats := &simStats{}
+	var wg sync.WaitGroup
+	resultsCh := make(chan Result, cfg.RPS*4)
+
+	allResults := make([]Result, 0, cfg.RPS*totalSeconds)
+	var consumerWg sync.WaitGroup
+	consumerWg.Add(1)
+	go func() {
+		defer consumerWg.Done()
+		for res := range resultsCh {
+			allResults = append(allResults, res)
+		}
+	}()
+
+	start := time.Now()
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+
+	for sec := 0; sec < totalSeconds; sec++ {
+		// Bu saniye için RPS kadar istek fırlat (beklemeden)
+		for i := 0; i < cfg.RPS; i++ {
+			wg.Add(1)
+			seed := time.Now().UnixNano() ^ int64(sec*cfg.RPS+i)
+			go func(seed int64) {
+				defer wg.Done()
+				defer func() {
+					if rec := recover(); rec != nil {
+						resultsCh <- Result{ErrType: "unknown", ErrMsg: fmt.Sprintf("panic: %v", rec)}
+					}
+				}()
+				rng := mathrand.New(mathrand.NewSource(seed))
+				inFlight := stats.inFlight.Add(1)
+				for {
+					peak := stats.peakInFlight.Load()
+					if inFlight <= peak || stats.peakInFlight.CompareAndSwap(peak, inFlight) {
+						break
+					}
+				}
+				res := doRequest(client, cfg, 0, rng, 0)
+				stats.inFlight.Add(-1)
+				stats.totalSent.Add(1)
+				resultsCh <- res
+			}(seed)
+		}
+
+		// Canlı durum: bu saniye sonunda kaç in-flight birikmiş
+		fmt.Printf("[%2ds/%ds] gönderildi=%d  in-flight=%d  (in-flight birikiyorsa server yetişemiyor)\n",
+			sec+1, totalSeconds, stats.totalSent.Load(), stats.inFlight.Load())
+
+		<-ticker.C // bir sonraki saniyeyi bekle
+	}
+
+	wg.Wait()
+	close(resultsCh)
+	consumerWg.Wait()
+
+	totalDuration := time.Since(start)
+	reporter.record(allResults)
+	reporter.printRateReport(cfg, totalDuration, allResults, stats)
+	return nil
+}
+
+func (r *Reporter) printRateReport(cfg Config, totalDuration time.Duration, all []Result, stats *simStats) {
+	total := len(all)
+	var success, failed int
+	latencies := make([]time.Duration, 0, total)
+	for _, res := range all {
+		latencies = append(latencies, res.Latency)
+		if res.ErrType == "" {
+			success++
+		} else {
+			failed++
+		}
+	}
+	m := computeMetrics(latencies)
+
+	secs := totalDuration.Seconds()
+	successfulRPS := float64(success) / secs
+	failedPct := 0.0
+	if total > 0 {
+		failedPct = 100.0 * float64(failed) / float64(total)
+	}
+
+	// Verdict: server hedef hızı kaldırdı mı?
+	var verdict string
+	switch {
+	case successfulRPS >= float64(cfg.RPS)*0.98 && m.P95 < cfg.Timeout/2:
+		verdict = "✅ KALDIRIYOR — server bu hızı rahat işliyor"
+	case successfulRPS >= float64(cfg.RPS)*0.95:
+		verdict = "⚠️  SINIRDA — kaldırıyor ama latency yükseliyor, tavana yakın"
+	default:
+		verdict = "❌ KALDIRAMIYOR — bu hız server kapasitesinin üstünde"
+	}
+
+	fmt.Println()
+	fmt.Println("╔══════════════════════════════════════════════════════════╗")
+	fmt.Println("║                   RATE TEST REPORT                       ║")
+	fmt.Println("╠══════════════════════════════════════════════════════════╣")
+	fmt.Printf("║ Target RPS:        %-38d║\n", cfg.RPS)
+	fmt.Printf("║ Duration:          %-38s║\n", totalDuration.Round(time.Second))
+	fmt.Printf("║ Total Sent:        %-38d║\n", total)
+	fmt.Printf("║ Successful:        %-38s║\n", fmt.Sprintf("%d", success))
+	fmt.Printf("║ Failed:            %-38s║\n", fmt.Sprintf("%d (%.1f%%)", failed, failedPct))
+	fmt.Println("║                                                          ║")
+	fmt.Printf("║ >>> Başarılı RPS:  %-38s║\n", fmt.Sprintf("%.0f req/s", successfulRPS))
+	fmt.Println("║                                                          ║")
+	fmt.Println("║ Latency:                                                 ║")
+	fmt.Printf("║   p50     = %-45s║\n", m.P50.Round(time.Millisecond))
+	fmt.Printf("║   p95     = %-45s║\n", m.P95.Round(time.Millisecond))
+	fmt.Printf("║   p99     = %-45s║\n", m.P99.Round(time.Millisecond))
+	fmt.Printf("║   max     = %-45s║\n", m.Max.Round(time.Millisecond))
+	fmt.Printf("║ Peak in-flight:    %-38d║\n", stats.peakInFlight.Load())
+	if len(r.errorCount) > 0 {
+		fmt.Println("║                                                          ║")
+		fmt.Println("║ Error Distribution:                                      ║")
+		for k, v := range r.errorCount {
+			fmt.Printf("║   %-20s : %-32d║\n", k, v)
+		}
+	}
+	fmt.Println("║                                                          ║")
+	fmt.Println("║ SONUÇ:                                                   ║")
+	fmt.Printf("║   %-54s║\n", verdict)
+	if r.totalErrors > 0 {
+		fmt.Printf("║   %-54s║\n", fmt.Sprintf("errors.log: %d kayıt", r.totalErrors))
+	}
+	fmt.Println("╚══════════════════════════════════════════════════════════╝")
+}
+
 func main() {
 	cfg := Config{}
-	flag.StringVar(&cfg.Mode, "mode", "burst", "Test modu: burst (dalga) veya simulate (sınav simülasyonu)")
+	flag.StringVar(&cfg.Mode, "mode", "burst", "Test modu: burst (dalga) | simulate (sınav) | rate (sabit hız)")
 	flag.StringVar(&cfg.Target, "target", "best-server", "Hedef tipi: best-server | login | userindex")
 	flag.StringVar(&cfg.URL, "url", "https://giris.sinavkutusu.com/api/best-server", "Hedef endpoint URL")
 	flag.IntVar(&cfg.Batch, "batch", 500, "[burst] Her dalgadaki eşzamanlı istek sayısı")
@@ -770,6 +933,9 @@ func main() {
 	flag.IntVar(&cfg.Questions, "questions", 25, "[simulate] Her öğrencinin cevaplayacağı soru sayısı")
 	flag.DurationVar(&cfg.ThinkTime, "think-time", 30*time.Second, "[simulate] Cevaplar arası ortalama düşünme süresi (±30%% jitter)")
 	flag.DurationVar(&cfg.Rampup, "rampup", 2*time.Minute, "[simulate] Öğrencilerin sınava giriş süresi (kademeli)")
+
+	// rate mode parametresi
+	flag.IntVar(&cfg.RPS, "rps", 300, "[rate] Saniyede gönderilecek sabit istek sayısı")
 
 	flag.Parse()
 
@@ -804,7 +970,14 @@ func main() {
 		if err := runSimulation(cfg); err != nil {
 			log.Fatal(err)
 		}
+	case "rate":
+		if cfg.RPS < 1 {
+			log.Fatal("rps en az 1 olmalı")
+		}
+		if err := runRate(cfg); err != nil {
+			log.Fatal(err)
+		}
 	default:
-		log.Fatalf("bilinmeyen mode: %q (burst veya simulate)", cfg.Mode)
+		log.Fatalf("bilinmeyen mode: %q (burst | simulate | rate)", cfg.Mode)
 	}
 }
