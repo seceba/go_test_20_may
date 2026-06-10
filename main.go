@@ -30,6 +30,8 @@ type Config struct {
 	Timeout      time.Duration
 	MaxUserIndex int
 	OkulKodu     string // login target için okul kodu
+	OgrenciNo    string // login target için öğrenci no
+	Phone        string // login target için telefon
 	ErrorsLog    string
 
 	// rate mode (sabit hız / open-loop)
@@ -154,12 +156,12 @@ func buildRequest(cfg Config, rng *mathrand.Rand, userIndex int) (*http.Request,
 	case "login":
 		lb := loginBody{
 			OkulKodu:    cfg.OkulKodu,
-			OgrenciNo:   fmt.Sprintf("%d", userIndex),
-			Phone:       "5550000000",
+			OgrenciNo:   cfg.OgrenciNo,
+			Phone:       cfg.Phone,
 			Sinif:       "9",
 			DogumTarihi: "2005-01-01",
-			Name:        "Load",
-			Surname:     "Test",
+			Name:        "AA",
+			Surname:     "BB",
 		}
 		payload, _ := json.Marshal(lb)
 		req, err := http.NewRequest(http.MethodPost, cfg.URL, bytes.NewReader(payload))
@@ -925,6 +927,8 @@ func main() {
 	flag.DurationVar(&cfg.Timeout, "timeout", 10*time.Second, "Her isteğin HTTP timeout süresi")
 	flag.IntVar(&cfg.MaxUserIndex, "max-user-index", 15000, "userIndex/ogrenciNo 1..N rastgele üretilir")
 	flag.StringVar(&cfg.OkulKodu, "okul-kodu", "311", "[login] Login için okul kodu")
+	flag.StringVar(&cfg.OgrenciNo, "ogrenci-no", "123", "[login] Login için öğrenci no (kayıtlı olmalı)")
+	flag.StringVar(&cfg.Phone, "phone", "123", "[login] Login için telefon")
 	flag.StringVar(&cfg.ErrorsLog, "errors-log", "errors.log", "Hata log dosyası yolu")
 
 	// simulate mode parametreleri
