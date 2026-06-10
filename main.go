@@ -147,6 +147,13 @@ type loginResponse struct {
 	} `json:"user"`
 }
 
+// stressResponse: /server/stress endpoint'i — her istekte DB sorgusu + JWT üretir.
+type stressResponse struct {
+	Ok  bool   `json:"ok"`
+	Db  int    `json:"db"`
+	Jwt string `json:"jwt"`
+}
+
 // buildRequest, target tipine göre HTTP method + body üretir.
 // userIndex == 0 → rastgele 1..MaxUserIndex. > 0 → o değer kullanılır.
 func buildRequest(cfg Config, rng *mathrand.Rand, userIndex int) (*http.Request, error) {
@@ -155,7 +162,7 @@ func buildRequest(cfg Config, rng *mathrand.Rand, userIndex int) (*http.Request,
 	}
 
 	switch cfg.Target {
-	case "best-server", "ping":
+	case "best-server", "ping", "stress":
 		// Auth gerektirmeyen hafif GET isteği, body yok.
 		return http.NewRequest(http.MethodGet, cfg.URL, nil)
 
@@ -205,6 +212,17 @@ func validateBody(cfg Config, bodyBytes []byte) (errType, errMsg string) {
 	switch cfg.Target {
 	case "ping":
 		// Health-check: HTTP 2xx geldiyse başarılı, body içeriğine bakma.
+		return "", ""
+
+	case "stress":
+		// DB + JWT endpoint'i: ok:true değilse uygulama hatası (yük altında DB çökebilir).
+		var sr stressResponse
+		if err := json.Unmarshal(bodyBytes, &sr); err != nil {
+			return "invalid_response", "JSON parse failed"
+		}
+		if !sr.Ok {
+			return "app_error", "ok=false (server yük altında bozuluyor)"
+		}
 		return "", ""
 
 	case "login":
@@ -982,10 +1000,10 @@ func main() {
 		log.Fatal("max-user-index en az 1 olmalı")
 	}
 	switch cfg.Target {
-	case "best-server", "login", "questions", "userindex", "ping":
+	case "best-server", "login", "questions", "userindex", "ping", "stress":
 		// geçerli
 	default:
-		log.Fatalf("bilinmeyen target: %q (best-server | login | questions | userindex | ping)", cfg.Target)
+		log.Fatalf("bilinmeyen target: %q (best-server | login | questions | userindex | ping | stress)", cfg.Target)
 	}
 
 	switch cfg.Mode {
