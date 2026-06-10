@@ -155,7 +155,7 @@ func buildRequest(cfg Config, rng *mathrand.Rand, userIndex int) (*http.Request,
 	}
 
 	switch cfg.Target {
-	case "best-server":
+	case "best-server", "ping":
 		// Auth gerektirmeyen hafif GET isteği, body yok.
 		return http.NewRequest(http.MethodGet, cfg.URL, nil)
 
@@ -203,6 +203,10 @@ func buildRequest(cfg Config, rng *mathrand.Rand, userIndex int) (*http.Request,
 // Başarılıysa "" döner, aksi halde (errType, errMsg) döner.
 func validateBody(cfg Config, bodyBytes []byte) (errType, errMsg string) {
 	switch cfg.Target {
+	case "ping":
+		// Health-check: HTTP 2xx geldiyse başarılı, body içeriğine bakma.
+		return "", ""
+
 	case "login":
 		var lr loginResponse
 		if err := json.Unmarshal(bodyBytes, &lr); err != nil {
@@ -978,10 +982,10 @@ func main() {
 		log.Fatal("max-user-index en az 1 olmalı")
 	}
 	switch cfg.Target {
-	case "best-server", "login", "questions", "userindex":
+	case "best-server", "login", "questions", "userindex", "ping":
 		// geçerli
 	default:
-		log.Fatalf("bilinmeyen target: %q (best-server | login | questions | userindex)", cfg.Target)
+		log.Fatalf("bilinmeyen target: %q (best-server | login | questions | userindex | ping)", cfg.Target)
 	}
 
 	switch cfg.Mode {
