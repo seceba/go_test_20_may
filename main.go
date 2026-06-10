@@ -32,6 +32,7 @@ type Config struct {
 	OkulKodu     string // login target için okul kodu
 	OgrenciNo    string // login target için öğrenci no
 	Phone        string // login target için telefon
+	Token        string // questions target için Bearer token
 	ErrorsLog    string
 
 	// rate mode (sabit hız / open-loop)
@@ -153,6 +154,17 @@ func buildRequest(cfg Config, rng *mathrand.Rand, userIndex int) (*http.Request,
 		// Auth gerektirmeyen hafif GET isteği, body yok.
 		return http.NewRequest(http.MethodGet, cfg.URL, nil)
 
+	case "questions":
+		// Sınav sorularını çekme — GET + Bearer token. URL'de ?code=... olmalı.
+		req, err := http.NewRequest(http.MethodGet, cfg.URL, nil)
+		if err != nil {
+			return nil, err
+		}
+		if cfg.Token != "" {
+			req.Header.Set("Authorization", "Bearer "+cfg.Token)
+		}
+		return req, nil
+
 	case "login":
 		lb := loginBody{
 			OkulKodu:    cfg.OkulKodu,
@@ -238,8 +250,10 @@ func doRequest(client *http.Client, cfg Config, wave int, rng *mathrand.Rand, us
 		return r
 	}
 
-	// 2xx geldi — target'a göre body doğrula
-	limited := io.LimitReader(resp.Body, 2048)
+	// 2xx geldi — target'a göre body doğrula.
+	// Limit 1MB: questions gibi büyük response'lar (35KB+) tam okunsun ki
+	// JSON parse edilebilsin. Gerçek client de tüm body'yi okur (gerçekçi network yükü).
+	limited := io.LimitReader(resp.Body, 1<<20)
 	bodyBytes, _ := io.ReadAll(limited)
 	if et, em := validateBody(cfg, bodyBytes); et != "" {
 		r.ErrType = et
@@ -929,6 +943,7 @@ func main() {
 	flag.StringVar(&cfg.OkulKodu, "okul-kodu", "311", "[login] Login için okul kodu")
 	flag.StringVar(&cfg.OgrenciNo, "ogrenci-no", "123", "[login] Login için öğrenci no (kayıtlı olmalı)")
 	flag.StringVar(&cfg.Phone, "phone", "123", "[login] Login için telefon")
+	flag.StringVar(&cfg.Token, "token", "", "[questions] Bearer token (Authorization header)")
 	flag.StringVar(&cfg.ErrorsLog, "errors-log", "errors.log", "Hata log dosyası yolu")
 
 	// simulate mode parametreleri
@@ -947,10 +962,10 @@ func main() {
 		log.Fatal("max-user-index en az 1 olmalı")
 	}
 	switch cfg.Target {
-	case "best-server", "login", "userindex":
+	case "best-server", "login", "questions", "userindex":
 		// geçerli
 	default:
-		log.Fatalf("bilinmeyen target: %q (best-server | login | userindex)", cfg.Target)
+		log.Fatalf("bilinmeyen target: %q (best-server | login | questions | userindex)", cfg.Target)
 	}
 
 	switch cfg.Mode {
